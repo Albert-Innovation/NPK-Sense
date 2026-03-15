@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useMemo, useCallback, Suspense } from "react";
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from "chart.js";
 import { useSearchParams } from "next/navigation";
-import { CheckCircle2, Zap, Microscope, Calculator as CalcIcon } from "lucide-react";
+import { CheckCircle2, Zap, Microscope, Calculator as CalcIcon, Camera, RotateCcw, CheckCheck } from "lucide-react";
 import ControlPanel from "@/components/ControlPanel";
 import ImagePreview, { CalibrationStep, ActivePickMode } from "@/components/ImagePreview";
 import StatCard from "@/components/StatCard";
@@ -17,10 +17,47 @@ const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "https://thadzy-npksense.hf.
 const API_URL = `${BASE_URL}/analyze_interactive`;
 const HEALTH_URL = `${BASE_URL}/health`;
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+// Minimum number of scans required before averaging.
+// 3 scans gives enough statistical spread to reduce sampling variance
+// without making the workflow too tedious for the user.
+const REQUIRED_SCANS = 3;
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Point = { x: number; y: number };
 type BackendStatus = "unknown" | "warming" | "ready" | "error";
+type MassScores = { N: number; P: number; K: number; Filler: number };
+
+// Stores the result of one completed scan so we can average across scans later.
+interface ScanResult {
+  scanIndex: number;
+  massScores: MassScores;
+  previewImage: string;
+}
+
+// ─── Helper: average mass scores across multiple scans ───────────────────────
+
+/**
+ * Averages N, P, K, Filler scores across all completed scan results.
+ * This reduces sampling variance caused by random pellet distribution
+ * differences between photos of the same mixture.
+ */
+function averageMassScores(results: ScanResult[]): MassScores {
+  if (results.length === 0) return { N: 0, P: 0, K: 0, Filler: 0 };
+  const sum = results.reduce(
+    (acc, r) => ({
+      N: acc.N + r.massScores.N,
+      P: acc.P + r.massScores.P,
+      K: acc.K + r.massScores.K,
+      Filler: acc.Filler + r.massScores.Filler,
+    }),
+    { N: 0, P: 0, K: 0, Filler: 0 }
+  );
+  const n = results.length;
+  return { N: sum.N / n, P: sum.P / n, K: sum.K / n, Filler: sum.Filler / n };
+}
 
 // ─── DashboardContent ─────────────────────────────────────────────────────────
 
@@ -45,7 +82,11 @@ function DashboardContent() {
   // Fertilizer targets & measurements
   const [totalWeight, setTotalWeight] = useState(100);
   const [targets, setTargets] = useState({ N: 15, P: 15, K: 15, Filler: 55 });
-  const [massScores, setMassScores] = useState({ N: 0, P: 0, K: 0, Filler: 0 });
+
+  // Multi-scan state
+  const [scanResults, setScanResults] = useState<ScanResult[]>([]);
+  const [massScores, setMassScores] = useState<MassScores>({ N: 0, P: 0, K: 0, Filler: 0 });
+  const [scanningComplete, setScanningComplete] = useState(false);
 
   // Multi-point calibration state
   const [calibrationStep, setCalibrationStep] = useState<CalibrationStep>("idle");
@@ -75,7 +116,7 @@ function DashboardContent() {
     return () => { cancelled = true; };
   }, []);
 
-  // ── URL params → pre-fill targets (from calculator deep-link) ──────────────
+  // ── URL params → pre-fill targets ──────────────────────────────────────────
 
   useEffect(() => {
     const n = parseFloat(searchParams.get("n") || "0");
@@ -144,21 +185,28 @@ function DashboardContent() {
     setActivePickMode("n");
   };
 
+  // Resets the entire scan session so the user can start a new set of 3 scans.
+  const handleResetSession = useCallback(() => {
+    setScanResults([]);
+    setMassScores({ N: 0, P: 0, K: 0, Filler: 0 });
+    setScanningComplete(false);
+    setFile(null);
+    setProcessedImage(null);
+    setCroppedRawImage(null);
+    setCurrentDisplayImage(null);
+    setLastCropPoints(null);
+    setCalibrationStep("idle");
+    resetCalibration();
+  }, []);
+
   // ── File upload ────────────────────────────────────────────────────────────
-  //
-  // FIX: Removed client-side resizeImageClientSide() that used to resize the
-  // image to 1024px before sending. The backend already handles resizing via
-  // imgsz=1024 inside YOLO's predict(). Resizing twice caused:
-  //   1. The image to be compressed with JPEG artifacts twice (quality loss).
-  //   2. The pixel coordinates of YOLO masks to be based on a pre-shrunk image,
-  //      making area measurements slightly off.
-  // Now the original file is sent directly. The browser FileReader still reads
-  // it as a data URL for the preview, but the File object sent to the backend
-  // is the original unmodified file.
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
+
+    // Auto-reset if a full session is already complete
+    if (scanningComplete) handleResetSession();
 
     setFile(selectedFile);
     setProcessedImage(null);
@@ -213,7 +261,7 @@ function DashboardContent() {
 
       if (res.status === 503) {
         setBackendStatus("warming");
-        alert("The AI backend is waking up (cold start). Please wait ~30 seconds and try again.");
+        alert("The AI backend is waking up. Please wait ~30 seconds and try again.");
         return;
       }
       if (!res.ok) {
@@ -227,7 +275,6 @@ function DashboardContent() {
         const rawCrop = data.raw_cropped_b64
           ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
           : null;
-
         if (rawCrop) {
           setCroppedRawImage(rawCrop);
           setCurrentDisplayImage(rawCrop);
@@ -242,10 +289,27 @@ function DashboardContent() {
 
         setProcessedImage(procImg);
         if (rawCrop) setCroppedRawImage(rawCrop);
-
         setCurrentDisplayImage(procImg);
+
         if (data.areas) {
-          setMassScores(data.areas);
+          // Use functional update to get the latest scanResults in this closure
+          setScanResults(prev => {
+            const newResult: ScanResult = {
+              scanIndex: prev.length,
+              massScores: data.areas as MassScores,
+              previewImage: procImg,
+            };
+            const updated = [...prev, newResult];
+
+            // Compute and apply the running average immediately
+            const averaged = averageMassScores(updated);
+            setMassScores(averaged);
+
+            if (updated.length >= REQUIRED_SCANS) {
+              setScanningComplete(true);
+            }
+            return updated;
+          });
         }
       }
 
@@ -286,6 +350,8 @@ function DashboardContent() {
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
+  const scansRemaining = Math.max(0, REQUIRED_SCANS - scanResults.length);
+
   return (
     <div className="bg-white font-sans selection:bg-blue-100">
 
@@ -297,9 +363,8 @@ function DashboardContent() {
         />
       )}
 
-      {/* ── Hero section ──────────────────────────────────────────────────── */}
+      {/* Hero */}
       <section className="relative min-h-[90vh] flex flex-col items-center justify-center px-4 overflow-hidden py-20">
-
         <div className="absolute inset-0 w-full h-full pointer-events-none">
           <div className="absolute inset-0 bg-white" />
           <div className="absolute -top-[10%] -right-[10%] w-[70vw] h-[70vw] rounded-full bg-gradient-to-b from-cyan-100 via-blue-200 to-transparent opacity-70 blur-[80px]" />
@@ -308,7 +373,6 @@ function DashboardContent() {
         </div>
 
         <div className="relative z-10 text-center max-w-5xl mx-auto space-y-10">
-
           <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white border border-blue-100 shadow-sm text-sm font-semibold text-blue-700 mb-4">
             <span className="flex h-2 w-2 relative">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-500 opacity-75" />
@@ -324,10 +388,7 @@ function DashboardContent() {
             </div>
           )}
           {backendStatus === "error" && (
-            <div
-              onClick={retryBackend}
-              className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-red-50 border border-red-200 text-red-600 text-xs font-medium mb-2 cursor-pointer hover:bg-red-100 transition-colors"
-            >
+            <div onClick={retryBackend} className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-red-50 border border-red-200 text-red-600 text-xs font-medium mb-2 cursor-pointer hover:bg-red-100 transition-colors">
               Backend unreachable - click to retry
             </div>
           )}
@@ -343,10 +404,7 @@ function DashboardContent() {
           </h1>
 
           <div className="flex flex-col sm:flex-row gap-4 justify-center pt-4">
-            <button
-              onClick={scrollToAnalyzer}
-              className="px-8 py-4 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white font-bold rounded-2xl shadow-xl flex items-center justify-center gap-2 text-lg transition-all"
-            >
+            <button onClick={scrollToAnalyzer} className="px-8 py-4 bg-blue-600 hover:bg-blue-700 active:scale-95 text-white font-bold rounded-2xl shadow-xl flex items-center justify-center gap-2 text-lg transition-all">
               <Microscope size={24} /> Start Analyzing
             </button>
           </div>
@@ -359,16 +417,14 @@ function DashboardContent() {
         </div>
       </section>
 
-      {/* ── Analysis dashboard ─────────────────────────────────────────────── */}
+      {/* Dashboard */}
       <div id="analyzer-section" className="min-h-screen py-20 bg-white border-t border-slate-100 relative z-20">
         <div className="max-w-7xl mx-auto px-4 lg:px-8">
-
           <div className="mb-12 text-center">
             <h2 className="text-3xl font-black text-slate-900">Analysis Dashboard</h2>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-
             <div className="lg:col-span-4 space-y-6">
               <ControlPanel
                 file={file}
@@ -382,6 +438,16 @@ function DashboardContent() {
             </div>
 
             <div className="lg:col-span-8 space-y-6 flex flex-col">
+
+              {/* Multi-scan progress */}
+              <ScanProgressBar
+                scanResults={scanResults}
+                requiredScans={REQUIRED_SCANS}
+                scanningComplete={scanningComplete}
+                loading={loading}
+                onReset={handleResetSession}
+              />
+
               <ImagePreview
                 loading={loading}
                 processedImage={processedImage}
@@ -399,15 +465,170 @@ function DashboardContent() {
                 onRecalibrate={handleRecalibrate}
               />
 
+              {/* Next scan prompt */}
+              {calibrationStep === "done" && !scanningComplete && (
+                <div className="flex items-center gap-3 px-5 py-4 bg-blue-50 border border-blue-200 rounded-2xl text-sm text-blue-700 font-medium">
+                  <Camera size={18} className="shrink-0" />
+                  <span>
+                    Scan {scanResults.length} of {REQUIRED_SCANS} recorded.
+                    {scansRemaining > 0
+                      ? ` Shake the sample and upload ${scansRemaining} more photo${scansRemaining > 1 ? "s" : ""} to improve accuracy.`
+                      : " Processing final average..."}
+                  </span>
+                </div>
+              )}
+
+              {/* Completion banner */}
+              {scanningComplete && (
+                <div className="flex items-center gap-3 px-5 py-4 bg-emerald-50 border border-emerald-200 rounded-2xl text-sm text-emerald-700 font-semibold">
+                  <CheckCheck size={18} className="shrink-0" />
+                  <span>All {REQUIRED_SCANS} scans averaged. Results are now statistically stable.</span>
+                  <button
+                    onClick={handleResetSession}
+                    className="ml-auto flex items-center gap-1.5 text-xs font-semibold text-emerald-600 hover:text-emerald-800 transition-colors"
+                  >
+                    <RotateCcw size={13} /> New session
+                  </button>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <StatCard label="N (Urea)" subLabel="46-0-0" value={finalWeights.N} total={totalWeight} target={targets.N} color="text-slate-600" barColor="bg-slate-400" />
                 <StatCard label="P (DAP)" subLabel="18-46-0" value={finalWeights.P} total={totalWeight} target={targets.P} color="text-emerald-600" barColor="bg-emerald-500" />
                 <StatCard label="K (Potash)" subLabel="0-0-60" value={finalWeights.K} total={totalWeight} target={targets.K} color="text-rose-600" barColor="bg-rose-500" />
                 <StatCard label="Filler" subLabel="Inert" value={finalWeights.Filler} total={totalWeight} target={targets.Filler} color="text-amber-600" barColor="bg-amber-400" />
               </div>
+
+              {/* Per-scan breakdown */}
+              {scanResults.length > 0 && (
+                <ScanBreakdownTable scanResults={scanResults} massScores={massScores} />
+              )}
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ScanProgressBar ──────────────────────────────────────────────────────────
+
+interface ScanProgressBarProps {
+  scanResults: ScanResult[];
+  requiredScans: number;
+  scanningComplete: boolean;
+  loading: boolean;
+  onReset: () => void;
+}
+
+function ScanProgressBar({ scanResults, requiredScans, scanningComplete, loading, onReset }: ScanProgressBarProps) {
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl px-5 py-4 shadow-sm">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-bold text-slate-700">Multi-Scan Progress</span>
+          <span className="text-xs text-slate-400">({requiredScans} scans required)</span>
+        </div>
+        {scanResults.length > 0 && !loading && (
+          <button onClick={onReset} className="flex items-center gap-1 text-xs text-slate-400 hover:text-red-500 transition-colors">
+            <RotateCcw size={11} /> Reset
+          </button>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2">
+        {Array.from({ length: requiredScans }).map((_, i) => {
+          const done = i < scanResults.length;
+          const active = i === scanResults.length && loading;
+          return (
+            <React.Fragment key={i}>
+              <div className={`
+                flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold border-2 transition-all
+                ${done ? "bg-emerald-500 border-emerald-500 text-white"
+                  : active ? "bg-blue-50 border-blue-400 text-blue-600 animate-pulse"
+                    : "bg-slate-50 border-slate-200 text-slate-400"}
+              `}>
+                {done ? <CheckCheck size={13} /> : i + 1}
+              </div>
+              {i < requiredScans - 1 && (
+                <div className={`flex-1 h-0.5 rounded-full transition-all ${i < scanResults.length ? "bg-emerald-300" : "bg-slate-100"}`} />
+              )}
+            </React.Fragment>
+          );
+        })}
+        <span className="ml-3 text-xs font-medium text-slate-500">
+          {scanningComplete
+            ? "Averaged"
+            : loading
+              ? `Processing scan ${scanResults.length + 1}...`
+              : scanResults.length === 0
+                ? "Upload first photo to begin"
+                : `${scanResults.length}/${requiredScans} — shake sample, upload next photo`}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ─── ScanBreakdownTable ───────────────────────────────────────────────────────
+
+interface ScanBreakdownTableProps {
+  scanResults: ScanResult[];
+  massScores: MassScores;
+}
+
+function ScanBreakdownTable({ scanResults, massScores }: ScanBreakdownTableProps) {
+  const toPercent = (scores: MassScores) => {
+    const total = scores.N + scores.P + scores.K + scores.Filler;
+    if (total === 0) return { N: 0, P: 0, K: 0, Filler: 0 };
+    return {
+      N: (scores.N / total) * 100,
+      P: (scores.P / total) * 100,
+      K: (scores.K / total) * 100,
+      Filler: (scores.Filler / total) * 100,
+    };
+  };
+
+  const avgPct = toPercent(massScores);
+
+  return (
+    <div className="bg-white border border-slate-100 rounded-2xl overflow-hidden shadow-sm">
+      <div className="px-5 py-3 border-b border-slate-100 bg-slate-50">
+        <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Per-Scan Breakdown</span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-xs text-slate-400 font-semibold uppercase tracking-wider border-b border-slate-100">
+              <td className="px-5 py-2">Scan</td>
+              <td className="px-4 py-2 text-right text-slate-500">N%</td>
+              <td className="px-4 py-2 text-right text-emerald-600">P%</td>
+              <td className="px-4 py-2 text-right text-rose-500">K%</td>
+              <td className="px-4 py-2 text-right text-amber-500">Filler%</td>
+            </tr>
+          </thead>
+          <tbody>
+            {scanResults.map((r, idx) => {
+              const pct = toPercent(r.massScores);
+              return (
+                <tr key={idx} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
+                  <td className="px-5 py-2.5 text-slate-600 font-medium">Scan {idx + 1}</td>
+                  <td className="px-4 py-2.5 text-right text-slate-600">{pct.N.toFixed(1)}</td>
+                  <td className="px-4 py-2.5 text-right text-emerald-600">{pct.P.toFixed(1)}</td>
+                  <td className="px-4 py-2.5 text-right text-rose-500">{pct.K.toFixed(1)}</td>
+                  <td className="px-4 py-2.5 text-right text-amber-500">{pct.Filler.toFixed(1)}</td>
+                </tr>
+              );
+            })}
+            <tr className="bg-blue-50 font-bold">
+              <td className="px-5 py-2.5 text-blue-700">Average</td>
+              <td className="px-4 py-2.5 text-right text-slate-700">{avgPct.N.toFixed(1)}</td>
+              <td className="px-4 py-2.5 text-right text-emerald-700">{avgPct.P.toFixed(1)}</td>
+              <td className="px-4 py-2.5 text-right text-rose-600">{avgPct.K.toFixed(1)}</td>
+              <td className="px-4 py-2.5 text-right text-amber-600">{avgPct.Filler.toFixed(1)}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
   );
@@ -420,9 +641,7 @@ interface FeatureCardProps { icon: React.ReactNode; title: string; desc: string 
 function FeatureCard({ icon, title, desc }: FeatureCardProps) {
   return (
     <div className="bg-white p-6 rounded-2xl border border-slate-100 shadow-sm text-left">
-      <div className="mb-4 bg-blue-50 w-12 h-12 rounded-xl flex items-center justify-center text-blue-600">
-        {icon}
-      </div>
+      <div className="mb-4 bg-blue-50 w-12 h-12 rounded-xl flex items-center justify-center text-blue-600">{icon}</div>
       <h3 className="font-bold text-slate-800 text-lg mb-3">{title}</h3>
       <p className="text-slate-500 text-sm">{desc}</p>
     </div>
