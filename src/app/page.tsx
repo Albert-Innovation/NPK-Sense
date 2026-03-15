@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useMemo, useCallback, Suspense } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense } from "react";
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from "chart.js";
 import { useSearchParams } from "next/navigation";
 import { CheckCircle2, Zap, Microscope, Calculator as CalcIcon, Camera, RotateCcw, CheckCheck } from "lucide-react";
@@ -39,66 +39,67 @@ interface ScanResult {
 
 // ─── Client-side perspective crop ────────────────────────────────────────────
 /**
- * Replicates the backend's four_point_transform in the browser using canvas.
- * Splits the quad into two triangles, each rendered with an affine warp.
+ * Replicates four_point_transform in the browser using horizontal strip decomposition.
+ * Each strip is a thin trapezoid approximated as an affine-warped rectangle.
  * Eliminates the crop_only backend round-trip — user sees calibration image instantly.
  */
 async function applyClientCrop(dataUrl: string, normPoints: Point[]): Promise<string> {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const W = img.naturalWidth, H = img.naturalHeight;
-      const src = normPoints.map(p => [p.x * W, p.y * H] as [number, number]);
-      const [tl, tr, br, bl] = src;
-      const dstW = Math.round(Math.max(
-        Math.hypot(tr[0] - tl[0], tr[1] - tl[1]),
-        Math.hypot(br[0] - bl[0], br[1] - bl[1]),
+      const W = img.naturalWidth;
+      const H = img.naturalHeight;
+      const [tl, tr, br, bl] = normPoints.map(p => ({ x: p.x * W, y: p.y * H }));
+      const outW = Math.round(Math.max(
+        Math.hypot(tr.x - tl.x, tr.y - tl.y),
+        Math.hypot(br.x - bl.x, br.y - bl.y),
       ));
-      const dstH = Math.round(Math.max(
-        Math.hypot(bl[0] - tl[0], bl[1] - tl[1]),
-        Math.hypot(br[0] - tr[0], br[1] - tr[1]),
+      const outH = Math.round(Math.max(
+        Math.hypot(bl.x - tl.x, bl.y - tl.y),
+        Math.hypot(br.x - tr.x, br.y - tr.y),
       ));
-      const canvas = document.createElement('canvas');
-      canvas.width = dstW; canvas.height = dstH;
-      const ctx = canvas.getContext('2d')!;
-
-      // Affine-warp one triangle: destination (d0,d1,d2) → source (s0,s1,s2)
-      const warpTri = (
-        [dx0,dy0]: [number,number], [dx1,dy1]: [number,number], [dx2,dy2]: [number,number],
-        [sx0,sy0]: [number,number], [sx1,sy1]: [number,number], [sx2,sy2]: [number,number],
-      ) => {
+      if (outW <= 0 || outH <= 0) { reject(new Error("Invalid crop dimensions")); return; }
+      const canvas = document.createElement("canvas");
+      canvas.width = outW;
+      canvas.height = outH;
+      const ctx = canvas.getContext("2d")!;
+      const STRIPS = 256;
+      for (let i = 0; i < STRIPS; i++) {
+        const t0 = i / STRIPS;
+        const t1 = (i + 1) / STRIPS;
+        const lx0 = tl.x + (bl.x - tl.x) * t0, ly0 = tl.y + (bl.y - tl.y) * t0;
+        const rx0 = tr.x + (br.x - tr.x) * t0, ry0 = tr.y + (br.y - tr.y) * t0;
+        const lx1 = tl.x + (bl.x - tl.x) * t1, ly1 = tl.y + (bl.y - tl.y) * t1;
+        const dy0 = t0 * outH;
+        const dy1 = t1 * outH;
+        const stripH = dy1 - dy0;
+        const a = (rx0 - lx0) / outW;
+        const b = (lx1 - lx0) / stripH;
+        const c = lx0;
+        const d = (ry0 - ly0) / outW;
+        const e = (ly1 - ly0) / stripH;
+        const f = ly0;
         ctx.save();
         ctx.beginPath();
-        ctx.moveTo(dx0,dy0); ctx.lineTo(dx1,dy1); ctx.lineTo(dx2,dy2);
-        ctx.closePath(); ctx.clip();
-        const d  = (dx0-dx2)*(dy1-dy2) - (dx1-dx2)*(dy0-dy2);
-        const a  = ((sx0-sx2)*(dy1-dy2) - (sx1-sx2)*(dy0-dy2)) / d;
-        const b  = ((sx1-sx2)*(dx0-dx2) - (sx0-sx2)*(dx1-dx2)) / d;
-        const c  = sx2 - a*dx2 - b*dy2;
-        const e  = ((sy0-sy2)*(dy1-dy2) - (sy1-sy2)*(dy0-dy2)) / d;
-        const f  = ((sy1-sy2)*(dx0-dx2) - (sy0-sy2)*(dx1-dx2)) / d;
-        const g  = sy2 - e*dx2 - f*dy2;
-        ctx.setTransform(a, e, b, f, c, g);
+        ctx.rect(0, dy0, outW, stripH + 0.5);
+        ctx.clip();
+        ctx.setTransform(a, d, b, e, c, f);
         ctx.drawImage(img, 0, 0);
         ctx.restore();
-      };
-
-      const dst = [[0,0],[dstW,0],[dstW,dstH],[0,dstH]] as [number,number][];
-      warpTri(dst[0], dst[1], dst[2], tl, tr, br);
-      warpTri(dst[0], dst[2], dst[3], tl, br, bl);
-
-      // Downscale to max 800px — matches backend resize_for_response
+      }
       const maxDim = 800;
-      const scale = Math.min(1, maxDim / Math.max(dstW, dstH));
+      const scale = Math.min(1, maxDim / Math.max(outW, outH));
       if (scale < 1) {
-        const c2 = document.createElement('canvas');
-        c2.width = Math.round(dstW * scale); c2.height = Math.round(dstH * scale);
-        c2.getContext('2d')!.drawImage(canvas, 0, 0, c2.width, c2.height);
-        resolve(c2.toDataURL('image/jpeg', 0.85));
+        const c2 = document.createElement("canvas");
+        c2.width  = Math.round(outW * scale);
+        c2.height = Math.round(outH * scale);
+        c2.getContext("2d")!.drawImage(canvas, 0, 0, c2.width, c2.height);
+        resolve(c2.toDataURL("image/jpeg", 0.85));
       } else {
-        resolve(canvas.toDataURL('image/jpeg', 0.85));
+        resolve(canvas.toDataURL("image/jpeg", 0.85));
       }
     };
+    img.onerror = () => reject(new Error("Failed to load image for crop"));
     img.src = dataUrl;
   });
 }
@@ -161,6 +162,14 @@ function DashboardContent() {
   const [refPPoints, setRefPPoints] = useState<Point[]>([]);
   const [refKPoints, setRefKPoints] = useState<Point[]>([]);
   const [refFillerPoints, setRefFillerPoints] = useState<Point[]>([]);
+
+  // Session crop region — locked after first crop, reused for all subsequent scans
+  const [sessionCropPoints, setSessionCropPoints] = useState<Point[] | null>(null);
+
+  // Auto-run debounce
+  const [autoRunPending, setAutoRunPending] = useState(false);
+  const autoRunTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleRunCalibrationRef = useRef<() => void>(() => {});
 
   // ── Backend health polling ──────────────────────────────────────────────────
 
@@ -266,17 +275,17 @@ function DashboardContent() {
     setCroppedRawImage(null);
     setCurrentDisplayImage(null);
     setLastCropPoints(null);
+    setSessionCropPoints(null);
     setCalibrationStep("idle");
     resetCalibration();
   }, []);
 
   // ── File upload ────────────────────────────────────────────────────────────
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
 
-    // Auto-reset if a full session is already complete
     if (scanningComplete) handleResetSession();
 
     setFile(selectedFile);
@@ -288,11 +297,22 @@ function DashboardContent() {
     resetCalibration();
 
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       const imgUrl = ev.target?.result as string | undefined;
       if (!imgUrl) return;
       setOriginalImage(imgUrl);
-      setIsCropping(true);
+
+      if (sessionCropPoints) {
+        // Reuse saved crop region — skip PerspectiveCropper entirely
+        setLastCropPoints(sessionCropPoints);
+        const cropped = await applyClientCrop(imgUrl, sessionCropPoints);
+        setCroppedRawImage(cropped);
+        setCurrentDisplayImage(cropped);
+        setCalibrationStep("calibrating");
+        scrollToAnalyzer();
+      } else {
+        setIsCropping(true);
+      }
     };
     reader.readAsDataURL(selectedFile);
     e.target.value = "";
@@ -301,9 +321,8 @@ function DashboardContent() {
   const handleCropConfirm = async (points: Point[]) => {
     setIsCropping(false);
     setLastCropPoints(points);
+    if (!sessionCropPoints) setSessionCropPoints(points);
     if (file && originalImage) {
-      // Warp the image client-side — instant, zero network calls.
-      // User can calibrate immediately; backend is only called once for YOLO.
       const cropped = await applyClientCrop(originalImage, points);
       setCroppedRawImage(cropped);
       setCurrentDisplayImage(cropped);
@@ -351,13 +370,8 @@ function DashboardContent() {
 
       const data = await res.json();
       const procImg = `data:image/jpeg;base64,${data.image_b64}`;
-      const rawCrop = data.raw_cropped_b64
-        ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
-        : null;
 
       setProcessedImage(procImg);
-      // Replace client-side preview with the authoritative server-side crop
-      if (rawCrop) setCroppedRawImage(rawCrop);
       setCurrentDisplayImage(procImg);
 
       if (data.areas) {
@@ -427,6 +441,34 @@ function DashboardContent() {
     setRefNPoints([]); setRefPPoints([]);
     setRefKPoints([]); setRefFillerPoints([]);
   };
+
+  // ── Auto-run: fire handleRunCalibration 500ms after all 4 classes are picked ─
+  // Keep ref current so the timeout always calls the latest version.
+  useEffect(() => { handleRunCalibrationRef.current = handleRunCalibration; });
+
+  useEffect(() => {
+    if (calibrationStep !== "calibrating") {
+      if (autoRunTimerRef.current) { clearTimeout(autoRunTimerRef.current); autoRunTimerRef.current = null; }
+      setAutoRunPending(false);
+      return;
+    }
+    const allFour = refNPoints.length >= 1 && refPPoints.length >= 1
+      && refKPoints.length >= 1 && refFillerPoints.length >= 1;
+    if (allFour) {
+      setAutoRunPending(true);
+      autoRunTimerRef.current = setTimeout(() => {
+        setAutoRunPending(false);
+        handleRunCalibrationRef.current();
+      }, 500);
+    } else {
+      if (autoRunTimerRef.current) { clearTimeout(autoRunTimerRef.current); autoRunTimerRef.current = null; }
+      setAutoRunPending(false);
+    }
+    return () => {
+      if (autoRunTimerRef.current) { clearTimeout(autoRunTimerRef.current); autoRunTimerRef.current = null; }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refNPoints, refPPoints, refKPoints, refFillerPoints, calibrationStep]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -528,6 +570,20 @@ function DashboardContent() {
                 onReset={handleResetSession}
               />
 
+              {/* Session crop lock banner */}
+              {sessionCropPoints && !scanningComplete && (
+                <div className="flex items-center gap-3 px-5 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-xs text-slate-600 font-medium">
+                  <span className="shrink-0 w-2 h-2 rounded-full bg-slate-400" />
+                  <span>Crop region locked from scan 1</span>
+                  <button
+                    onClick={() => { setSessionCropPoints(null); if (originalImage) setIsCropping(true); }}
+                    className="ml-auto text-xs text-slate-500 hover:text-slate-800 underline underline-offset-2 transition-colors whitespace-nowrap"
+                  >
+                    Re-crop
+                  </button>
+                </div>
+              )}
+
               {/* Cancel & Start Over — visible during an active (incomplete) multi-scan session */}
               {scanResults.length >= 1 && !scanningComplete && (
                 <button
@@ -557,6 +613,7 @@ function DashboardContent() {
                 onRecalibrate={handleRecalibrate}
                 onUndoLastPoint={handleUndoLastPoint}
                 onClearAllPoints={handleClearAllPoints}
+                autoRunLabel={autoRunPending ? "Auto-analyzing in 0.5s…" : undefined}
               />
 
               {/* Next scan prompt */}

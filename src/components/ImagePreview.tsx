@@ -30,6 +30,7 @@ interface ImagePreviewProps {
   onRecalibrate?:      () => void;
   onUndoLastPoint?:    () => void;
   onClearAllPoints?:   () => void;
+  autoRunLabel?:       string;
 }
 
 // ─── Style constants ──────────────────────────────────────────────────────────
@@ -120,6 +121,7 @@ export default function ImagePreview({
   onRecalibrate,
   onUndoLastPoint,
   onClearAllPoints,
+  autoRunLabel,
 }: ImagePreviewProps) {
   const isCalibrating  = calibrationStep === "calibrating";
   const totalRefPoints = refNPoints.length + refPPoints.length + refKPoints.length + refFillerPoints.length;
@@ -386,12 +388,19 @@ export default function ImagePreview({
             >
               Clear all
             </button>
-            <span className="hidden sm:block text-slate-600 text-[10px] truncate ml-1">
-              {activePickMode === "n" ? "← click white N prills" :
-               activePickMode === "p" ? "← click green P granules" :
-               activePickMode === "k" ? "← click red K granules" :
-               "← click tan Filler particles"}
-            </span>
+            {autoRunLabel ? (
+              <span className="hidden sm:flex items-center gap-1.5 text-[10px] text-purple-300 font-medium ml-1">
+                <span className="inline-block w-2.5 h-2.5 border border-purple-400 border-t-transparent rounded-full animate-spin" />
+                {autoRunLabel}
+              </span>
+            ) : (
+              <span className="hidden sm:block text-slate-600 text-[10px] truncate ml-1">
+                {activePickMode === "n" ? "← click white N prills" :
+                 activePickMode === "p" ? "← click green P granules" :
+                 activePickMode === "k" ? "← click red K granules" :
+                 "← click tan Filler particles"}
+              </span>
+            )}
           </div>
         </div>
       )}
