@@ -19,9 +19,6 @@ const HEALTH_URL = `${BASE_URL}/health`;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-// Minimum number of scans required before averaging.
-// 3 scans gives enough statistical spread to reduce sampling variance
-// without making the workflow too tedious for the user.
 const REQUIRED_SCANS = 3;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -30,96 +27,14 @@ type Point = { x: number; y: number };
 type BackendStatus = "unknown" | "warming" | "ready" | "error";
 type MassScores = { N: number; P: number; K: number; Filler: number };
 
-// Stores the result of one completed scan so we can average across scans later.
 interface ScanResult {
   scanIndex: number;
   massScores: MassScores;
   previewImage: string;
 }
 
-// ─── Client-side perspective crop ────────────────────────────────────────────
-/**
- * Replicates the backend's four_point_transform in the browser using canvas.
- * Splits the quad into two triangles, each rendered with an affine warp.
- * Eliminates the crop_only backend round-trip — user sees calibration image instantly.
- */
-async function applyClientCrop(dataUrl: string, normPoints: Point[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      const W = img.naturalWidth;
-      const H = img.naturalHeight;
-      const [tl, tr, br, bl] = normPoints.map(p => ({ x: p.x * W, y: p.y * H }));
+// ─── Helper: average mass scores ─────────────────────────────────────────────
 
-      const outW = Math.round(Math.max(
-        Math.hypot(tr.x - tl.x, tr.y - tl.y),
-        Math.hypot(br.x - bl.x, br.y - bl.y),
-      ));
-      const outH = Math.round(Math.max(
-        Math.hypot(bl.x - tl.x, bl.y - tl.y),
-        Math.hypot(br.x - tr.x, br.y - tr.y),
-      ));
-
-      if (outW <= 0 || outH <= 0) { reject(new Error("Invalid crop dimensions")); return; }
-
-      const canvas = document.createElement("canvas");
-      canvas.width = outW;
-      canvas.height = outH;
-      const ctx = canvas.getContext("2d")!;
-
-      const STRIPS = 256;
-      for (let i = 0; i < STRIPS; i++) {
-        const t0 = i / STRIPS;
-        const t1 = (i + 1) / STRIPS;
-
-        const lx0 = tl.x + (bl.x - tl.x) * t0,  ly0 = tl.y + (bl.y - tl.y) * t0;
-        const rx0 = tr.x + (br.x - tr.x) * t0,   ry0 = tr.y + (br.y - tr.y) * t0;
-        const lx1 = tl.x + (bl.x - tl.x) * t1,   ly1 = tl.y + (bl.y - tl.y) * t1;
-
-        const dy0 = t0 * outH;
-        const dy1 = t1 * outH;
-        const stripH = dy1 - dy0;
-
-        const a = (rx0 - lx0) / outW;
-        const b = (lx1 - lx0) / stripH;
-        const c = lx0;
-        const d = (ry0 - ly0) / outW;
-        const e = (ly1 - ly0) / stripH;
-        const f = ly0;
-
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(0, dy0, outW, stripH + 0.5);
-        ctx.clip();
-        ctx.setTransform(a, d, b, e, c, f);
-        ctx.drawImage(img, 0, 0);
-        ctx.restore();
-      }
-
-      const maxDim = 800;
-      const scale = Math.min(1, maxDim / Math.max(outW, outH));
-      if (scale < 1) {
-        const c2 = document.createElement("canvas");
-        c2.width  = Math.round(outW * scale);
-        c2.height = Math.round(outH * scale);
-        c2.getContext("2d")!.drawImage(canvas, 0, 0, c2.width, c2.height);
-        resolve(c2.toDataURL("image/jpeg", 0.85));
-      } else {
-        resolve(canvas.toDataURL("image/jpeg", 0.85));
-      }
-    };
-    img.onerror = () => reject(new Error("Failed to load image for crop"));
-    img.src = dataUrl;
-  });
-}
-
-// ─── Helper: average mass scores across multiple scans ───────────────────────
-
-/**
- * Averages N, P, K, Filler scores across all completed scan results.
- * This reduces sampling variance caused by random pellet distribution
- * differences between photos of the same mixture.
- */
 function averageMassScores(results: ScanResult[]): MassScores {
   if (results.length === 0) return { N: 0, P: 0, K: 0, Filler: 0 };
   const sum = results.reduce(
@@ -140,7 +55,6 @@ function averageMassScores(results: ScanResult[]): MassScores {
 function DashboardContent() {
   const searchParams = useSearchParams();
 
-  // Image & upload state
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [originalImage, setOriginalImage] = useState<string | null>(null);
@@ -148,23 +62,18 @@ function DashboardContent() {
   const [croppedRawImage, setCroppedRawImage] = useState<string | null>(null);
   const [currentDisplayImage, setCurrentDisplayImage] = useState<string | null>(null);
 
-  // Perspective-crop state
   const [isCropping, setIsCropping] = useState(false);
   const [lastCropPoints, setLastCropPoints] = useState<Point[] | null>(null);
 
-  // Backend health
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("unknown");
 
-  // Fertilizer targets & measurements
   const [totalWeight, setTotalWeight] = useState(100);
   const [targets, setTargets] = useState({ N: 15, P: 15, K: 15, Filler: 55 });
 
-  // Multi-scan state
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
   const [massScores, setMassScores] = useState<MassScores>({ N: 0, P: 0, K: 0, Filler: 0 });
   const [scanningComplete, setScanningComplete] = useState(false);
 
-  // Per-scan UI calibration state — what the user is currently clicking
   const [calibrationStep, setCalibrationStep] = useState<CalibrationStep>("idle");
   const [activePickMode, setActivePickMode] = useState<ActivePickMode>("n");
   const [refNPoints, setRefNPoints] = useState<Point[]>([]);
@@ -194,7 +103,7 @@ function DashboardContent() {
     return () => { cancelled = true; };
   }, []);
 
-  // ── URL params → pre-fill targets ──────────────────────────────────────────
+  // ── URL params ──────────────────────────────────────────────────────────────
 
   useEffect(() => {
     const n = parseFloat(searchParams.get("n") || "0");
@@ -208,7 +117,7 @@ function DashboardContent() {
     }
   }, [searchParams]);
 
-  // ── Derived weights & chart data ───────────────────────────────────────────
+  // ── Derived weights ─────────────────────────────────────────────────────────
 
   const { finalWeights, pieChartData } = useMemo(() => {
     const total = Object.values(massScores).reduce((a, b) => a + b, 0);
@@ -265,8 +174,6 @@ function DashboardContent() {
     setActivePickMode("n");
   };
 
-  // Resets the entire scan session so the user can start a new set of 3 scans.
-  // Also clears session-level calibration so the next session calibrates fresh.
   const handleResetSession = useCallback(() => {
     setScanResults([]);
     setMassScores({ N: 0, P: 0, K: 0, Filler: 0 });
@@ -286,7 +193,6 @@ function DashboardContent() {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
 
-    // Auto-reset if a full session is already complete
     if (scanningComplete) handleResetSession();
 
     setFile(selectedFile);
@@ -308,18 +214,58 @@ function DashboardContent() {
     e.target.value = "";
   };
 
-  const handleCropConfirm = async (points: Point[]) => {
+  // ── Crop confirm — uses backend crop_only for correct OpenCV perspective warp ──
+
+  const handleCropConfirm = (points: Point[]) => {
     setIsCropping(false);
     setLastCropPoints(points);
-    if (file && originalImage) {
-      // Warp the image client-side — instant, zero network calls.
-      // User can calibrate immediately; backend is only called once for YOLO.
-      const cropped = await applyClientCrop(originalImage, points);
-      setCroppedRawImage(cropped);
-      setCurrentDisplayImage(cropped);
-      resetCalibration();
-      setCalibrationStep("calibrating");
+    if (file) {
+      // Always use backend crop_only mode.
+      // OpenCV warpPerspective is the correct perspective transform.
+      // Client-side canvas approaches (triangle affine or strip-based) produce
+      // distorted results because the HTML Canvas API only supports affine
+      // transforms, not true perspective projection.
+      cropOnly(file, points);
       scrollToAnalyzer();
+    }
+  };
+
+  // ── crop_only: get warped preview from backend, then enter calibration ──────
+
+  const cropOnly = async (selectedFile: File, points: Point[]) => {
+    setLoading(true);
+    const formData = new FormData();
+    formData.append("file", selectedFile);
+    formData.append("mode", "crop_only");
+    formData.append("points", JSON.stringify(points));
+
+    try {
+      const res = await fetch(API_URL, { method: "POST", body: formData });
+      if (res.status === 503) {
+        setBackendStatus("warming");
+        alert("The AI backend is waking up. Please wait ~30 seconds and try again.");
+        return;
+      }
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+
+      const data = await res.json();
+      const rawCrop = data.raw_cropped_b64
+        ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
+        : null;
+
+      if (rawCrop) {
+        setCroppedRawImage(rawCrop);
+        setCurrentDisplayImage(rawCrop);
+        resetCalibration();
+        setCalibrationStep("calibrating");
+      }
+
+      setBackendStatus("ready");
+    } catch (err) {
+      console.error("cropOnly error:", err);
+      alert(`Crop failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -340,7 +286,7 @@ function DashboardContent() {
     formData.append("mode", "analyze");
 
     const cropPoints = points ?? lastCropPoints;
-    if (cropPoints) formData.append("points", JSON.stringify(cropPoints));
+    if (cropPoints)           formData.append("points",            JSON.stringify(cropPoints));
     if (refN.length > 0)      formData.append("ref_n_points",      JSON.stringify(refN));
     if (refP.length > 0)      formData.append("ref_p_points",      JSON.stringify(refP));
     if (refK.length > 0)      formData.append("ref_k_points",      JSON.stringify(refK));
@@ -361,18 +307,12 @@ function DashboardContent() {
 
       const data = await res.json();
       const procImg = `data:image/jpeg;base64,${data.image_b64}`;
-      const rawCrop = data.raw_cropped_b64
-        ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
-        : null;
 
       setProcessedImage(procImg);
-      // Replace client-side preview with the authoritative server-side crop
-      if (rawCrop) setCroppedRawImage(rawCrop);
       setCurrentDisplayImage(procImg);
 
       if (data.areas) {
         setScanResults(prev => {
-          // replaceLast=true when recalibrating — overwrite the slot, not add a new scan
           const base = replaceLast && prev.length > 0 ? prev.slice(0, -1) : prev;
           const newResult: ScanResult = {
             scanIndex: base.length,
@@ -415,8 +355,6 @@ function DashboardContent() {
     const totalPoints = refNPoints.length + refPPoints.length + refKPoints.length + refFillerPoints.length;
     if (!file || totalPoints < 1) return;
     setCalibrationStep("done");
-    // processedImage !== null means a scan was already counted for this image;
-    // replace that slot instead of adding a new scan entry.
     analyzeImage(file, lastCropPoints, refNPoints, refPPoints, refKPoints, refFillerPoints, processedImage !== null);
   };
 
@@ -529,7 +467,6 @@ function DashboardContent() {
 
             <div className="lg:col-span-8 space-y-6 flex flex-col">
 
-              {/* Multi-scan progress */}
               <ScanProgressBar
                 scanResults={scanResults}
                 requiredScans={REQUIRED_SCANS}
@@ -538,7 +475,6 @@ function DashboardContent() {
                 onReset={handleResetSession}
               />
 
-              {/* Cancel & Start Over — visible during an active (incomplete) multi-scan session */}
               {scanResults.length >= 1 && !scanningComplete && (
                 <button
                   onClick={handleResetSession}
@@ -569,7 +505,6 @@ function DashboardContent() {
                 onClearAllPoints={handleClearAllPoints}
               />
 
-              {/* Next scan prompt */}
               {calibrationStep === "done" && !scanningComplete && (
                 <div className="flex items-center gap-3 px-5 py-4 bg-blue-50 border border-blue-200 rounded-2xl text-sm text-blue-700 font-medium">
                   <Camera size={18} className="shrink-0" />
@@ -582,7 +517,6 @@ function DashboardContent() {
                 </div>
               )}
 
-              {/* Completion banner */}
               {scanningComplete && (
                 <div className="flex items-center gap-3 px-5 py-4 bg-emerald-50 border border-emerald-200 rounded-2xl text-sm text-emerald-700 font-semibold">
                   <CheckCheck size={18} className="shrink-0" />
@@ -597,13 +531,12 @@ function DashboardContent() {
               )}
 
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <StatCard label="N (Urea)" subLabel="46-0-0" value={finalWeights.N} total={totalWeight} target={targets.N} color="text-slate-600" barColor="bg-slate-400" />
-                <StatCard label="P (DAP)" subLabel="18-46-0" value={finalWeights.P} total={totalWeight} target={targets.P} color="text-emerald-600" barColor="bg-emerald-500" />
-                <StatCard label="K (Potash)" subLabel="0-0-60" value={finalWeights.K} total={totalWeight} target={targets.K} color="text-rose-600" barColor="bg-rose-500" />
-                <StatCard label="Filler" subLabel="Inert" value={finalWeights.Filler} total={totalWeight} target={targets.Filler} color="text-amber-600" barColor="bg-amber-400" />
+                <StatCard label="N (Urea)"   subLabel="46-0-0"  value={finalWeights.N}      total={totalWeight} target={targets.N}      color="text-slate-600"   barColor="bg-slate-400"  />
+                <StatCard label="P (DAP)"    subLabel="18-46-0" value={finalWeights.P}       total={totalWeight} target={targets.P}      color="text-emerald-600" barColor="bg-emerald-500" />
+                <StatCard label="K (Potash)" subLabel="0-0-60"  value={finalWeights.K}       total={totalWeight} target={targets.K}      color="text-rose-600"    barColor="bg-rose-500"   />
+                <StatCard label="Filler"     subLabel="Inert"   value={finalWeights.Filler}  total={totalWeight} target={targets.Filler} color="text-amber-600"   barColor="bg-amber-400"  />
               </div>
 
-              {/* Per-scan breakdown */}
               {scanResults.length > 0 && (
                 <ScanBreakdownTable scanResults={scanResults} massScores={massScores} />
               )}
@@ -642,15 +575,15 @@ function ScanProgressBar({ scanResults, requiredScans, scanningComplete, loading
 
       <div className="flex items-center gap-2">
         {Array.from({ length: requiredScans }).map((_, i) => {
-          const done = i < scanResults.length;
+          const done   = i < scanResults.length;
           const active = i === scanResults.length && loading;
           return (
             <React.Fragment key={i}>
               <div className={`
                 flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold border-2 transition-all
-                ${done ? "bg-emerald-500 border-emerald-500 text-white"
-                  : active ? "bg-blue-50 border-blue-400 text-blue-600 animate-pulse"
-                    : "bg-slate-50 border-slate-200 text-slate-400"}
+                ${done   ? "bg-emerald-500 border-emerald-500 text-white"
+                : active ? "bg-blue-50 border-blue-400 text-blue-600 animate-pulse"
+                         : "bg-slate-50 border-slate-200 text-slate-400"}
               `}>
                 {done ? <CheckCheck size={13} /> : i + 1}
               </div>
@@ -686,9 +619,9 @@ function ScanBreakdownTable({ scanResults, massScores }: ScanBreakdownTableProps
     const total = scores.N + scores.P + scores.K + scores.Filler;
     if (total === 0) return { N: 0, P: 0, K: 0, Filler: 0 };
     return {
-      N: (scores.N / total) * 100,
-      P: (scores.P / total) * 100,
-      K: (scores.K / total) * 100,
+      N:      (scores.N      / total) * 100,
+      P:      (scores.P      / total) * 100,
+      K:      (scores.K      / total) * 100,
       Filler: (scores.Filler / total) * 100,
     };
   };
