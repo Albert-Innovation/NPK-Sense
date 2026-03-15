@@ -92,13 +92,17 @@ function DashboardContent() {
   const [calibrationStep, setCalibrationStep] = useState<CalibrationStep>("idle");
   const [activePickMode, setActivePickMode] = useState<ActivePickMode>("n");
   const [refNPoints, setRefNPoints] = useState<Point[]>([]);
+  const [refPPoints, setRefPPoints] = useState<Point[]>([]);
+  const [refKPoints, setRefKPoints] = useState<Point[]>([]);
   const [refFillerPoints, setRefFillerPoints] = useState<Point[]>([]);
 
   // Session-level calibration: locked in after the FIRST scan's calibration run.
-  // Every subsequent scan reuses these points automatically so the N/Filler
-  // classification boundary is identical across all scans in the session.
+  // Every subsequent scan reuses these points automatically so the classification
+  // boundary is identical across all scans in the session.
   // Only cleared when the user explicitly starts a new session.
   const [sessionRefNPoints, setSessionRefNPoints] = useState<Point[]>([]);
+  const [sessionRefPPoints, setSessionRefPPoints] = useState<Point[]>([]);
+  const [sessionRefKPoints, setSessionRefKPoints] = useState<Point[]>([]);
   const [sessionRefFillerPoints, setSessionRefFillerPoints] = useState<Point[]>([]);
 
   // ── Backend health polling ──────────────────────────────────────────────────
@@ -188,6 +192,8 @@ function DashboardContent() {
 
   const resetCalibration = () => {
     setRefNPoints([]);
+    setRefPPoints([]);
+    setRefKPoints([]);
     setRefFillerPoints([]);
     setActivePickMode("n");
   };
@@ -206,6 +212,8 @@ function DashboardContent() {
     setCalibrationStep("idle");
     resetCalibration();
     setSessionRefNPoints([]);
+    setSessionRefPPoints([]);
+    setSessionRefKPoints([]);
     setSessionRefFillerPoints([]);
   }, []);
 
@@ -245,11 +253,11 @@ function DashboardContent() {
         // Session calibration already exists from scan 1.
         // Skip crop_only mode and go straight to full analysis using the
         // saved reference points — no user interaction needed.
-        analyzeImage(file, points, sessionRefNPoints, sessionRefFillerPoints, false);
+        analyzeImage(file, points, sessionRefNPoints, sessionRefPPoints, sessionRefKPoints, sessionRefFillerPoints, false);
         setCalibrationStep("done");
       } else {
         // First scan: request crop_only so the user can calibrate.
-        analyzeImage(file, points, [], [], true);
+        analyzeImage(file, points, [], [], [], [], true);
       }
       scrollToAnalyzer();
     }
@@ -261,6 +269,8 @@ function DashboardContent() {
     selectedFile: File,
     points: Point[] | null = null,
     refN: Point[] = [],
+    refP: Point[] = [],
+    refK: Point[] = [],
     refFiller: Point[] = [],
     enterCalibration = false,
   ) => {
@@ -271,6 +281,8 @@ function DashboardContent() {
     const cropPoints = points ?? lastCropPoints;
     if (cropPoints) formData.append("points", JSON.stringify(cropPoints));
     if (refN.length > 0) formData.append("ref_n_points", JSON.stringify(refN));
+    if (refP.length > 0) formData.append("ref_p_points", JSON.stringify(refP));
+    if (refK.length > 0) formData.append("ref_k_points", JSON.stringify(refK));
     if (refFiller.length > 0) formData.append("ref_filler_points", JSON.stringify(refFiller));
 
     formData.append("mode", enterCalibration ? "crop_only" : "analyze");
@@ -351,29 +363,46 @@ function DashboardContent() {
 
   const handleCalibrationClick = (point: Point) => {
     if (calibrationStep !== "calibrating") return;
-    if (activePickMode === "n") setRefNPoints(prev => [...prev, point]);
-    else setRefFillerPoints(prev => [...prev, point]);
+    if (activePickMode === "n")          setRefNPoints(prev => [...prev, point]);
+    else if (activePickMode === "p")     setRefPPoints(prev => [...prev, point]);
+    else if (activePickMode === "k")     setRefKPoints(prev => [...prev, point]);
+    else                                 setRefFillerPoints(prev => [...prev, point]);
   };
 
   const handleRunCalibration = () => {
-    if (!file || refNPoints.length < 1 || refFillerPoints.length < 1) return;
+    const totalPoints = refNPoints.length + refPPoints.length + refKPoints.length + refFillerPoints.length;
+    if (!file || totalPoints < 1) return;
     setCalibrationStep("done");
 
     // Lock these picks as the session reference on the very first scan.
     // All subsequent scans will reuse them automatically, keeping the
-    // N/Filler classification boundary identical across all scans.
-    if (sessionRefNPoints.length === 0) {
+    // classification boundary identical across all scans.
+    if (sessionRefNPoints.length === 0 && totalPoints > 0) {
       setSessionRefNPoints(refNPoints);
+      setSessionRefPPoints(refPPoints);
+      setSessionRefKPoints(refKPoints);
       setSessionRefFillerPoints(refFillerPoints);
     }
 
-    analyzeImage(file, lastCropPoints, refNPoints, refFillerPoints);
+    analyzeImage(file, lastCropPoints, refNPoints, refPPoints, refKPoints, refFillerPoints);
   };
 
   const handleRecalibrate = () => {
     setActivePickMode("n");
     setCalibrationStep("calibrating");
     if (croppedRawImage) setCurrentDisplayImage(croppedRawImage);
+  };
+
+  const handleUndoLastPoint = () => {
+    if (activePickMode === "n")      setRefNPoints(prev => prev.slice(0, -1));
+    else if (activePickMode === "p") setRefPPoints(prev => prev.slice(0, -1));
+    else if (activePickMode === "k") setRefKPoints(prev => prev.slice(0, -1));
+    else                             setRefFillerPoints(prev => prev.slice(0, -1));
+  };
+
+  const handleClearAllPoints = () => {
+    setRefNPoints([]); setRefPPoints([]);
+    setRefKPoints([]); setRefFillerPoints([]);
   };
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -476,6 +505,16 @@ function DashboardContent() {
                 onReset={handleResetSession}
               />
 
+              {/* Cancel & Start Over — visible during an active (incomplete) multi-scan session */}
+              {scanResults.length >= 1 && !scanningComplete && (
+                <button
+                  onClick={handleResetSession}
+                  className="w-full px-4 py-2.5 rounded-2xl border-2 border-red-300 text-red-600 text-sm font-semibold hover:bg-red-50 active:scale-[0.99] transition-all"
+                >
+                  Cancel &amp; Start Over
+                </button>
+              )}
+
               <ImagePreview
                 loading={loading}
                 processedImage={processedImage}
@@ -485,12 +524,16 @@ function DashboardContent() {
                 calibrationStep={calibrationStep}
                 activePickMode={activePickMode}
                 refNPoints={refNPoints}
+                refPPoints={refPPoints}
+                refKPoints={refKPoints}
                 refFillerPoints={refFillerPoints}
                 onCalibrationClick={handleCalibrationClick}
                 onSetPickMode={setActivePickMode}
                 onStartCalibration={handleStartCalibration}
                 onRunCalibration={handleRunCalibration}
                 onRecalibrate={handleRecalibrate}
+                onUndoLastPoint={handleUndoLastPoint}
+                onClearAllPoints={handleClearAllPoints}
               />
 
               {/* Session calibration locked indicator — shown from scan 2 onward */}
@@ -498,11 +541,16 @@ function DashboardContent() {
                 <div className="flex items-center gap-3 px-5 py-3 bg-violet-50 border border-violet-200 rounded-2xl text-xs text-violet-700 font-medium">
                   <span className="shrink-0 w-2 h-2 rounded-full bg-violet-400" />
                   <span>
-                    Using calibration from scan 1 ({sessionRefNPoints.length} N + {sessionRefFillerPoints.length} Filler points)
-                    — boundary is locked for consistent N/Filler classification.
+                    Using calibration from scan 1 ({[
+                      sessionRefNPoints.length > 0 && `${sessionRefNPoints.length}N`,
+                      sessionRefPPoints.length > 0 && `${sessionRefPPoints.length}P`,
+                      sessionRefKPoints.length > 0 && `${sessionRefKPoints.length}K`,
+                      sessionRefFillerPoints.length > 0 && `${sessionRefFillerPoints.length}F`,
+                    ].filter(Boolean).join(" + ")} pts)
+                    — boundary is locked for consistent classification.
                   </span>
                   <button
-                    onClick={() => { setSessionRefNPoints([]); setSessionRefFillerPoints([]); handleRecalibrate(); }}
+                    onClick={() => { setSessionRefNPoints([]); setSessionRefPPoints([]); setSessionRefKPoints([]); setSessionRefFillerPoints([]); handleRecalibrate(); }}
                     className="ml-auto text-xs text-violet-500 hover:text-violet-800 underline underline-offset-2 transition-colors whitespace-nowrap"
                   >
                     Override
