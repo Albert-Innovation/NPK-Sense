@@ -264,11 +264,14 @@ function DashboardContent() {
         resetCalibration();
         setCalibrationStep("calibrating");
 
-        // Convert the cropped base64 back to a File so subsequent analyzeImage
-        // calls send this small (~150KB) image instead of the original (~5MB).
-        // This is the biggest latency win: 30x smaller upload per analyze call.
-        const blob = await fetch(rawCrop).then(r => r.blob());
-        setCroppedFile(new File([blob], "cropped.jpg", { type: "image/jpeg" }));
+        // Convert the cropped base64 to a File for faster subsequent uploads.
+        // Uses atob + Uint8Array instead of fetch(dataUrl) which is slow on
+        // some browsers because it routes through the network stack.
+        const b64 = rawCrop.split(",")[1];
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        setCroppedFile(new File([bytes], "cropped.jpg", { type: "image/jpeg" }));
       }
 
       setBackendStatus("ready");
@@ -394,13 +397,6 @@ function DashboardContent() {
   const handleClearAllPoints = () => {
     setRefNPoints([]); setRefPPoints([]);
     setRefKPoints([]); setRefFillerPoints([]);
-  };
-
-  const handleRemovePoint = (mode: ActivePickMode, index: number) => {
-    if (mode === "n")      setRefNPoints(prev => prev.filter((_, i) => i !== index));
-    else if (mode === "p") setRefPPoints(prev => prev.filter((_, i) => i !== index));
-    else if (mode === "k") setRefKPoints(prev => prev.filter((_, i) => i !== index));
-    else                   setRefFillerPoints(prev => prev.filter((_, i) => i !== index));
   };
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -530,7 +526,6 @@ function DashboardContent() {
                 onRecalibrate={handleRecalibrate}
                 onUndoLastPoint={handleUndoLastPoint}
                 onClearAllPoints={handleClearAllPoints}
-                onRemovePoint={handleRemovePoint}
               />
 
               {calibrationStep === "done" && !scanningComplete && (
