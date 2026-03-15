@@ -13,14 +13,55 @@ ChartJS.register(ArcElement, Tooltip, Legend);
 
 // ─── API endpoints ────────────────────────────────────────────────────────────
 
-const BASE_URL   = process.env.NEXT_PUBLIC_API_URL || "https://thadzy-npksense.hf.space";
-const API_URL    = `${BASE_URL}/analyze_interactive`;
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "https://thadzy-npksense.hf.space";
+const API_URL = `${BASE_URL}/analyze_interactive`;
 const HEALTH_URL = `${BASE_URL}/health`;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Point        = { x: number; y: number };
+type Point = { x: number; y: number };
 type BackendStatus = "unknown" | "warming" | "ready" | "error";
+
+// แทรกฟังก์ชันนี้ไว้ด้านบนสุด (ใต้บรรทัด import หรือก่อนเริ่ม function DashboardContent)
+/**
+ * Resizes an image file on the client-side using HTML5 Canvas.
+ * @param {File} file - Original image file.
+ * @param {number} maxWidth - Maximum width allowed.
+ * @returns {Promise<File>} Resized file.
+ */
+const resizeImageClientSide = (file: File, maxWidth: number = 1024): Promise<File> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let newWidth = img.width;
+        let newHeight = img.height;
+
+        if (img.width > maxWidth) {
+          newWidth = maxWidth;
+          newHeight = Math.round((img.height * maxWidth) / img.width);
+        }
+
+        canvas.width = newWidth;
+        canvas.height = newHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return reject(new Error("Canvas failed"));
+
+        ctx.drawImage(img, 0, 0, newWidth, newHeight);
+        canvas.toBlob((blob) => {
+          if (blob) resolve(new File([blob], file.name, { type: 'image/jpeg' }));
+          else reject(new Error("Blob failed"));
+        }, 'image/jpeg', 0.8);
+      };
+      img.onerror = reject;
+    };
+    reader.onerror = reject;
+  });
+};
 
 // ─── DashboardContent ─────────────────────────────────────────────────────────
 
@@ -28,15 +69,15 @@ function DashboardContent() {
   const searchParams = useSearchParams();
 
   // Image & upload state
-  const [file,                setFile]               = useState<File | null>(null);
-  const [loading,             setLoading]            = useState(false);
-  const [originalImage,       setOriginalImage]      = useState<string | null>(null);
-  const [processedImage,      setProcessedImage]     = useState<string | null>(null);
-  const [croppedRawImage,     setCroppedRawImage]    = useState<string | null>(null);
+  const [file, setFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [originalImage, setOriginalImage] = useState<string | null>(null);
+  const [processedImage, setProcessedImage] = useState<string | null>(null);
+  const [croppedRawImage, setCroppedRawImage] = useState<string | null>(null);
   const [currentDisplayImage, setCurrentDisplayImage] = useState<string | null>(null);
 
   // Perspective-crop state
-  const [isCropping,     setIsCropping]     = useState(false);
+  const [isCropping, setIsCropping] = useState(false);
   const [lastCropPoints, setLastCropPoints] = useState<Point[] | null>(null);
 
   // Backend health
@@ -44,13 +85,13 @@ function DashboardContent() {
 
   // Fertilizer targets & measurements
   const [totalWeight, setTotalWeight] = useState(100);
-  const [targets,     setTargets]     = useState({ N: 15, P: 15, K: 15, Filler: 55 });
-  const [massScores,  setMassScores]  = useState({ N: 0, P: 0, K: 0, Filler: 0 });
+  const [targets, setTargets] = useState({ N: 15, P: 15, K: 15, Filler: 55 });
+  const [massScores, setMassScores] = useState({ N: 0, P: 0, K: 0, Filler: 0 });
 
   // Multi-point calibration state
   const [calibrationStep, setCalibrationStep] = useState<CalibrationStep>("idle");
-  const [activePickMode,  setActivePickMode]  = useState<ActivePickMode>("n");
-  const [refNPoints,      setRefNPoints]      = useState<Point[]>([]);
+  const [activePickMode, setActivePickMode] = useState<ActivePickMode>("n");
+  const [refNPoints, setRefNPoints] = useState<Point[]>([]);
   const [refFillerPoints, setRefFillerPoints] = useState<Point[]>([]);
 
   // ── Backend health polling ──────────────────────────────────────────────────
@@ -94,12 +135,12 @@ function DashboardContent() {
   // Memoized so they don't re-compute on unrelated state changes.
 
   const { finalWeights, pieChartData } = useMemo(() => {
-    const total  = Object.values(massScores).reduce((a, b) => a + b, 0);
+    const total = Object.values(massScores).reduce((a, b) => a + b, 0);
     const factor = total > 0 ? totalWeight / total : 0;
     const fw = {
-      N:      massScores.N      * factor,
-      P:      massScores.P      * factor,
-      K:      massScores.K      * factor,
+      N: massScores.N * factor,
+      P: massScores.P * factor,
+      K: massScores.K * factor,
       Filler: massScores.Filler * factor,
     };
     return {
@@ -136,8 +177,8 @@ function DashboardContent() {
       if (key === "Filler") return { ...prev, Filler: newVal };
       const updated = { ...prev, [key]: newVal };
       const nutrientSum = (key === "N" ? newVal : prev.N)
-                        + (key === "P" ? newVal : prev.P)
-                        + (key === "K" ? newVal : prev.K);
+        + (key === "P" ? newVal : prev.P)
+        + (key === "K" ? newVal : prev.K);
       return { ...updated, Filler: Math.max(0, 100 - nutrientSum) };
     });
   }, []);
@@ -150,27 +191,36 @@ function DashboardContent() {
 
   // ── File upload ────────────────────────────────────────────────────────────
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (!selectedFile) return;
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedOriginalFile = e.target.files?.[0];
+    if (!selectedOriginalFile) return;
 
-    setFile(selectedFile);
-    setProcessedImage(null);
-    setCroppedRawImage(null);
-    setCurrentDisplayImage(null);
-    setLastCropPoints(null);
-    setCalibrationStep("idle");
-    resetCalibration();
+    try {
+      // ทำการย่อขนาดภาพก่อนทำงานอื่น
+      const selectedFile = await resizeImageClientSide(selectedOriginalFile, 1024);
 
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const imgUrl = ev.target?.result as string | undefined;
-      if (!imgUrl) return;
-      setOriginalImage(imgUrl);
-      setIsCropping(true);
-    };
-    reader.readAsDataURL(selectedFile);
-    e.target.value = "";
+      setFile(selectedFile);
+      setProcessedImage(null);
+      setCroppedRawImage(null);
+      setCurrentDisplayImage(null);
+      setLastCropPoints(null);
+      setCalibrationStep("idle");
+      resetCalibration();
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const imgUrl = ev.target?.result as string | undefined;
+        if (!imgUrl) return;
+        setOriginalImage(imgUrl);
+        setIsCropping(true); // เปิดหน้าต่างลากมุมทันที
+      };
+      // อ่านไฟล์ที่ถูกย่อขนาดแล้ว
+      reader.readAsDataURL(selectedFile);
+      e.target.value = "";
+    } catch (error) {
+      console.error("Error resizing image:", error);
+      alert("Image processing failed.");
+    }
   };
 
   const handleCropConfirm = (points: Point[]) => {
@@ -186,15 +236,20 @@ function DashboardContent() {
 
   // ── Core analysis call ─────────────────────────────────────────────────────
 
+  /**
+   * Triggers the backend analysis or image cropping process.
+   * Handles both 'crop_only' early exits and full YOLO inference responses.
+   * * @param {File} selectedFile - The uploaded image file.
+   * @param {Point[] | null} points - Coordinates for the perspective transform (warping).
+   * @param {Point[]} refN - Selected LAB reference points for Nitrogen.
+   * @param {Point[]} refFiller - Selected LAB reference points for Filler.
+   * @param {boolean} enterCalibration - If true, requests only the cropped image from backend (bypasses YOLO).
+   */
   const analyzeImage = async (
-    selectedFile:    File,
-    points:          Point[] | null = null,
-    refN:            Point[]        = [],
-    refFiller:       Point[]        = [],
-    // When true (first load after crop), skip showing the YOLO result and
-    // go straight into calibration mode so the user is forced to calibrate
-    // before seeing any output. Coordinates are on the warped image, so we
-    // still need this initial call to obtain raw_cropped_b64.
+    selectedFile: File,
+    points: Point[] | null = null,
+    refN: Point[] = [],
+    refFiller: Point[] = [],
     enterCalibration = false,
   ) => {
     setLoading(true);
@@ -202,15 +257,21 @@ function DashboardContent() {
     formData.append("file", selectedFile);
 
     const cropPoints = points ?? lastCropPoints;
-    if (cropPoints)          formData.append("points",           JSON.stringify(cropPoints));
-    if (refN.length > 0)     formData.append("ref_n_points",     JSON.stringify(refN));
+    if (cropPoints) formData.append("points", JSON.stringify(cropPoints));
+    if (refN.length > 0) formData.append("ref_n_points", JSON.stringify(refN));
     if (refFiller.length > 0) formData.append("ref_filler_points", JSON.stringify(refFiller));
+
+    // 1. กำหนด Mode การทำงานส่งไปให้ Backend
+    if (enterCalibration) {
+      formData.append("mode", "crop_only");
+    } else {
+      formData.append("mode", "analyze");
+    }
 
     try {
       const res = await fetch(API_URL, { method: "POST", body: formData });
 
       if (res.status === 503) {
-        // HF Spaces cold-start — let the user know and bail early.
         setBackendStatus("warming");
         alert("The AI backend is waking up (cold start). Please wait ~30 seconds and try again.");
         return;
@@ -221,26 +282,36 @@ function DashboardContent() {
       }
 
       const data = await res.json();
-      const procImg = `data:image/jpeg;base64,${data.image_b64}`;
-      const rawCrop = data.raw_cropped_b64
-        ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
-        : null;
 
-      setProcessedImage(procImg);
-      if (rawCrop) setCroppedRawImage(rawCrop);
+      // 2. แยกการจัดการข้อมูลตอบกลับ (Response Handling) ตาม Mode
+      if (enterCalibration) {
+        // กรณี Crop อย่างเดียว Backend จะส่งมาแค่ raw_cropped_b64
+        const rawCrop = data.raw_cropped_b64
+          ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
+          : null;
 
-      if (enterCalibration && rawCrop) {
-        // Force calibration: show the raw warped image and open the calibration
-        // bar. The YOLO result from this call is stored but intentionally hidden
-        // until the user completes calibration and triggers a proper analysis.
-        setCurrentDisplayImage(rawCrop);
-        resetCalibration();
-        setCalibrationStep("calibrating");
+        if (rawCrop) {
+          setCroppedRawImage(rawCrop);
+          setCurrentDisplayImage(rawCrop); // แสดงภาพดิบทันที
+          resetCalibration();
+          setCalibrationStep("calibrating"); // เปิดแถบเครื่องมือจิ้มสี
+        }
       } else {
-        setCurrentDisplayImage(procImg);
+        // กรณี Analyze เต็มรูปแบบ Backend จะส่งมาครบทั้งภาพที่ประมวลผลแล้วและค่าสัดส่วน
+        const procImg = `data:image/jpeg;base64,${data.image_b64}`;
+        const rawCrop = data.raw_cropped_b64
+          ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
+          : null;
+
+        setProcessedImage(procImg);
+        if (rawCrop) setCroppedRawImage(rawCrop);
+
+        setCurrentDisplayImage(procImg); // แสดงภาพที่มี Mask สีต่างๆ
+        if (data.areas) {
+          setMassScores(data.areas); // อัปเดตตัวเลขเปอร์เซ็นต์
+        }
       }
 
-      setMassScores(data.areas);
       setBackendStatus("ready");
     } catch (err) {
       console.error("analyzeImage error:", err);
@@ -262,7 +333,7 @@ function DashboardContent() {
   const handleCalibrationClick = (point: Point) => {
     if (calibrationStep !== "calibrating") return;
     if (activePickMode === "n") setRefNPoints(prev => [...prev, point]);
-    else                        setRefFillerPoints(prev => [...prev, point]);
+    else setRefFillerPoints(prev => [...prev, point]);
   };
 
   const handleRunCalibration = () => {
@@ -349,9 +420,9 @@ function DashboardContent() {
           </div>
 
           <div className="pt-16 grid grid-cols-1 md:grid-cols-3 gap-6">
-            <FeatureCard icon={<Zap           className="w-6 h-6" />}                    title="Instant AI Analysis" desc="Detects N, P, K particles in milliseconds." />
-            <FeatureCard icon={<CheckCircle2  className="w-6 h-6 text-emerald-500" />}  title="Physics Engine"      desc="Calculates weight based on volume & density." />
-            <FeatureCard icon={<CalcIcon      className="w-6 h-6 text-purple-500" />}   title="Reverse Recipe"      desc="Reverse engineering your mix recipe." />
+            <FeatureCard icon={<Zap className="w-6 h-6" />} title="Instant AI Analysis" desc="Detects N, P, K particles in milliseconds." />
+            <FeatureCard icon={<CheckCircle2 className="w-6 h-6 text-emerald-500" />} title="Physics Engine" desc="Calculates weight based on volume & density." />
+            <FeatureCard icon={<CalcIcon className="w-6 h-6 text-purple-500" />} title="Reverse Recipe" desc="Reverse engineering your mix recipe." />
           </div>
         </div>
       </section>
@@ -386,7 +457,7 @@ function DashboardContent() {
                 processedImage={processedImage}
                 currentDisplayImage={currentDisplayImage}
                 onToggleStart={() => { if (croppedRawImage) setCurrentDisplayImage(croppedRawImage); }}
-                onToggleEnd={()   => { if (processedImage)  setCurrentDisplayImage(processedImage);  }}
+                onToggleEnd={() => { if (processedImage) setCurrentDisplayImage(processedImage); }}
                 calibrationStep={calibrationStep}
                 activePickMode={activePickMode}
                 refNPoints={refNPoints}
@@ -399,10 +470,10 @@ function DashboardContent() {
               />
 
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <StatCard label="N (Urea)"   subLabel="46-0-0" value={finalWeights.N}      total={totalWeight} target={targets.N}      color="text-slate-600"  barColor="bg-slate-400"  />
-                <StatCard label="P (DAP)"    subLabel="18-46-0" value={finalWeights.P}     total={totalWeight} target={targets.P}      color="text-emerald-600" barColor="bg-emerald-500" />
-                <StatCard label="K (Potash)" subLabel="0-0-60"  value={finalWeights.K}     total={totalWeight} target={targets.K}      color="text-rose-600"   barColor="bg-rose-500"   />
-                <StatCard label="Filler"     subLabel="Inert"   value={finalWeights.Filler} total={totalWeight} target={targets.Filler} color="text-amber-600"  barColor="bg-amber-400"  />
+                <StatCard label="N (Urea)" subLabel="46-0-0" value={finalWeights.N} total={totalWeight} target={targets.N} color="text-slate-600" barColor="bg-slate-400" />
+                <StatCard label="P (DAP)" subLabel="18-46-0" value={finalWeights.P} total={totalWeight} target={targets.P} color="text-emerald-600" barColor="bg-emerald-500" />
+                <StatCard label="K (Potash)" subLabel="0-0-60" value={finalWeights.K} total={totalWeight} target={targets.K} color="text-rose-600" barColor="bg-rose-500" />
+                <StatCard label="Filler" subLabel="Inert" value={finalWeights.Filler} total={totalWeight} target={targets.Filler} color="text-amber-600" barColor="bg-amber-400" />
               </div>
             </div>
           </div>
