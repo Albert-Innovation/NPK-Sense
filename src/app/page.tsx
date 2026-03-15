@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense } from "react";
+import React, { useState, useEffect, useMemo, useCallback, Suspense } from "react";
 import { Chart as ChartJS, ArcElement, Tooltip, Legend } from "chart.js";
 import { useSearchParams } from "next/navigation";
 import { CheckCircle2, Zap, Microscope, Calculator as CalcIcon, Camera, RotateCcw, CheckCheck } from "lucide-react";
@@ -39,8 +39,8 @@ interface ScanResult {
 
 // ─── Client-side perspective crop ────────────────────────────────────────────
 /**
- * Replicates four_point_transform in the browser using horizontal strip decomposition.
- * Each strip is a thin trapezoid approximated as an affine-warped rectangle.
+ * Replicates the backend's four_point_transform in the browser using canvas.
+ * Splits the quad into two triangles, each rendered with an affine warp.
  * Eliminates the crop_only backend round-trip — user sees calibration image instantly.
  */
 async function applyClientCrop(dataUrl: string, normPoints: Point[]): Promise<string> {
@@ -50,6 +50,7 @@ async function applyClientCrop(dataUrl: string, normPoints: Point[]): Promise<st
       const W = img.naturalWidth;
       const H = img.naturalHeight;
       const [tl, tr, br, bl] = normPoints.map(p => ({ x: p.x * W, y: p.y * H }));
+
       const outW = Math.round(Math.max(
         Math.hypot(tr.x - tl.x, tr.y - tl.y),
         Math.hypot(br.x - bl.x, br.y - bl.y),
@@ -58,27 +59,34 @@ async function applyClientCrop(dataUrl: string, normPoints: Point[]): Promise<st
         Math.hypot(bl.x - tl.x, bl.y - tl.y),
         Math.hypot(br.x - tr.x, br.y - tr.y),
       ));
+
       if (outW <= 0 || outH <= 0) { reject(new Error("Invalid crop dimensions")); return; }
+
       const canvas = document.createElement("canvas");
       canvas.width = outW;
       canvas.height = outH;
       const ctx = canvas.getContext("2d")!;
+
       const STRIPS = 256;
       for (let i = 0; i < STRIPS; i++) {
         const t0 = i / STRIPS;
         const t1 = (i + 1) / STRIPS;
-        const lx0 = tl.x + (bl.x - tl.x) * t0, ly0 = tl.y + (bl.y - tl.y) * t0;
-        const rx0 = tr.x + (br.x - tr.x) * t0, ry0 = tr.y + (br.y - tr.y) * t0;
-        const lx1 = tl.x + (bl.x - tl.x) * t1, ly1 = tl.y + (bl.y - tl.y) * t1;
+
+        const lx0 = tl.x + (bl.x - tl.x) * t0,  ly0 = tl.y + (bl.y - tl.y) * t0;
+        const rx0 = tr.x + (br.x - tr.x) * t0,   ry0 = tr.y + (br.y - tr.y) * t0;
+        const lx1 = tl.x + (bl.x - tl.x) * t1,   ly1 = tl.y + (bl.y - tl.y) * t1;
+
         const dy0 = t0 * outH;
         const dy1 = t1 * outH;
         const stripH = dy1 - dy0;
+
         const a = (rx0 - lx0) / outW;
         const b = (lx1 - lx0) / stripH;
         const c = lx0;
         const d = (ry0 - ly0) / outW;
         const e = (ly1 - ly0) / stripH;
         const f = ly0;
+
         ctx.save();
         ctx.beginPath();
         ctx.rect(0, dy0, outW, stripH + 0.5);
@@ -87,6 +95,7 @@ async function applyClientCrop(dataUrl: string, normPoints: Point[]): Promise<st
         ctx.drawImage(img, 0, 0);
         ctx.restore();
       }
+
       const maxDim = 800;
       const scale = Math.min(1, maxDim / Math.max(outW, outH));
       if (scale < 1) {
@@ -162,14 +171,6 @@ function DashboardContent() {
   const [refPPoints, setRefPPoints] = useState<Point[]>([]);
   const [refKPoints, setRefKPoints] = useState<Point[]>([]);
   const [refFillerPoints, setRefFillerPoints] = useState<Point[]>([]);
-
-  // Session crop region — locked after first crop, reused for all subsequent scans
-  const [sessionCropPoints, setSessionCropPoints] = useState<Point[] | null>(null);
-
-  // Auto-run debounce
-  const [autoRunPending, setAutoRunPending] = useState(false);
-  const autoRunTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const handleRunCalibrationRef = useRef<() => void>(() => {});
 
   // ── Backend health polling ──────────────────────────────────────────────────
 
@@ -275,17 +276,17 @@ function DashboardContent() {
     setCroppedRawImage(null);
     setCurrentDisplayImage(null);
     setLastCropPoints(null);
-    setSessionCropPoints(null);
     setCalibrationStep("idle");
     resetCalibration();
   }, []);
 
   // ── File upload ────────────────────────────────────────────────────────────
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (!selectedFile) return;
 
+    // Auto-reset if a full session is already complete
     if (scanningComplete) handleResetSession();
 
     setFile(selectedFile);
@@ -297,22 +298,11 @@ function DashboardContent() {
     resetCalibration();
 
     const reader = new FileReader();
-    reader.onload = async (ev) => {
+    reader.onload = (ev) => {
       const imgUrl = ev.target?.result as string | undefined;
       if (!imgUrl) return;
       setOriginalImage(imgUrl);
-
-      if (sessionCropPoints) {
-        // Reuse saved crop region — skip PerspectiveCropper entirely
-        setLastCropPoints(sessionCropPoints);
-        const cropped = await applyClientCrop(imgUrl, sessionCropPoints);
-        setCroppedRawImage(cropped);
-        setCurrentDisplayImage(cropped);
-        setCalibrationStep("calibrating");
-        scrollToAnalyzer();
-      } else {
-        setIsCropping(true);
-      }
+      setIsCropping(true);
     };
     reader.readAsDataURL(selectedFile);
     e.target.value = "";
@@ -321,8 +311,9 @@ function DashboardContent() {
   const handleCropConfirm = async (points: Point[]) => {
     setIsCropping(false);
     setLastCropPoints(points);
-    if (!sessionCropPoints) setSessionCropPoints(points);
     if (file && originalImage) {
+      // Warp the image client-side — instant, zero network calls.
+      // User can calibrate immediately; backend is only called once for YOLO.
       const cropped = await applyClientCrop(originalImage, points);
       setCroppedRawImage(cropped);
       setCurrentDisplayImage(cropped);
@@ -370,8 +361,13 @@ function DashboardContent() {
 
       const data = await res.json();
       const procImg = `data:image/jpeg;base64,${data.image_b64}`;
+      const rawCrop = data.raw_cropped_b64
+        ? `data:image/jpeg;base64,${data.raw_cropped_b64}`
+        : null;
 
       setProcessedImage(procImg);
+      // Replace client-side preview with the authoritative server-side crop
+      if (rawCrop) setCroppedRawImage(rawCrop);
       setCurrentDisplayImage(procImg);
 
       if (data.areas) {
@@ -441,34 +437,6 @@ function DashboardContent() {
     setRefNPoints([]); setRefPPoints([]);
     setRefKPoints([]); setRefFillerPoints([]);
   };
-
-  // ── Auto-run: fire handleRunCalibration 500ms after all 4 classes are picked ─
-  // Keep ref current so the timeout always calls the latest version.
-  useEffect(() => { handleRunCalibrationRef.current = handleRunCalibration; });
-
-  useEffect(() => {
-    if (calibrationStep !== "calibrating") {
-      if (autoRunTimerRef.current) { clearTimeout(autoRunTimerRef.current); autoRunTimerRef.current = null; }
-      setAutoRunPending(false);
-      return;
-    }
-    const allFour = refNPoints.length >= 1 && refPPoints.length >= 1
-      && refKPoints.length >= 1 && refFillerPoints.length >= 1;
-    if (allFour) {
-      setAutoRunPending(true);
-      autoRunTimerRef.current = setTimeout(() => {
-        setAutoRunPending(false);
-        handleRunCalibrationRef.current();
-      }, 500);
-    } else {
-      if (autoRunTimerRef.current) { clearTimeout(autoRunTimerRef.current); autoRunTimerRef.current = null; }
-      setAutoRunPending(false);
-    }
-    return () => {
-      if (autoRunTimerRef.current) { clearTimeout(autoRunTimerRef.current); autoRunTimerRef.current = null; }
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refNPoints, refPPoints, refKPoints, refFillerPoints, calibrationStep]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -570,20 +538,6 @@ function DashboardContent() {
                 onReset={handleResetSession}
               />
 
-              {/* Session crop lock banner */}
-              {sessionCropPoints && !scanningComplete && (
-                <div className="flex items-center gap-3 px-5 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-xs text-slate-600 font-medium">
-                  <span className="shrink-0 w-2 h-2 rounded-full bg-slate-400" />
-                  <span>Crop region locked from scan 1</span>
-                  <button
-                    onClick={() => { setSessionCropPoints(null); if (originalImage) setIsCropping(true); }}
-                    className="ml-auto text-xs text-slate-500 hover:text-slate-800 underline underline-offset-2 transition-colors whitespace-nowrap"
-                  >
-                    Re-crop
-                  </button>
-                </div>
-              )}
-
               {/* Cancel & Start Over — visible during an active (incomplete) multi-scan session */}
               {scanResults.length >= 1 && !scanningComplete && (
                 <button
@@ -613,7 +567,6 @@ function DashboardContent() {
                 onRecalibrate={handleRecalibrate}
                 onUndoLastPoint={handleUndoLastPoint}
                 onClearAllPoints={handleClearAllPoints}
-                autoRunLabel={autoRunPending ? "Auto-analyzing in 0.5s…" : undefined}
               />
 
               {/* Next scan prompt */}
