@@ -88,11 +88,18 @@ function DashboardContent() {
   const [massScores, setMassScores] = useState<MassScores>({ N: 0, P: 0, K: 0, Filler: 0 });
   const [scanningComplete, setScanningComplete] = useState(false);
 
-  // Multi-point calibration state
+  // Per-scan UI calibration state — what the user is currently clicking
   const [calibrationStep, setCalibrationStep] = useState<CalibrationStep>("idle");
   const [activePickMode, setActivePickMode] = useState<ActivePickMode>("n");
   const [refNPoints, setRefNPoints] = useState<Point[]>([]);
   const [refFillerPoints, setRefFillerPoints] = useState<Point[]>([]);
+
+  // Session-level calibration: locked in after the FIRST scan's calibration run.
+  // Every subsequent scan reuses these points automatically so the N/Filler
+  // classification boundary is identical across all scans in the session.
+  // Only cleared when the user explicitly starts a new session.
+  const [sessionRefNPoints, setSessionRefNPoints] = useState<Point[]>([]);
+  const [sessionRefFillerPoints, setSessionRefFillerPoints] = useState<Point[]>([]);
 
   // ── Backend health polling ──────────────────────────────────────────────────
 
@@ -186,6 +193,7 @@ function DashboardContent() {
   };
 
   // Resets the entire scan session so the user can start a new set of 3 scans.
+  // Also clears session-level calibration so the next session calibrates fresh.
   const handleResetSession = useCallback(() => {
     setScanResults([]);
     setMassScores({ N: 0, P: 0, K: 0, Filler: 0 });
@@ -197,6 +205,8 @@ function DashboardContent() {
     setLastCropPoints(null);
     setCalibrationStep("idle");
     resetCalibration();
+    setSessionRefNPoints([]);
+    setSessionRefFillerPoints([]);
   }, []);
 
   // ── File upload ────────────────────────────────────────────────────────────
@@ -231,7 +241,16 @@ function DashboardContent() {
     setIsCropping(false);
     setLastCropPoints(points);
     if (file) {
-      analyzeImage(file, points, [], [], true);
+      if (sessionRefNPoints.length > 0) {
+        // Session calibration already exists from scan 1.
+        // Skip crop_only mode and go straight to full analysis using the
+        // saved reference points — no user interaction needed.
+        analyzeImage(file, points, sessionRefNPoints, sessionRefFillerPoints, false);
+        setCalibrationStep("done");
+      } else {
+        // First scan: request crop_only so the user can calibrate.
+        analyzeImage(file, points, [], [], true);
+      }
       scrollToAnalyzer();
     }
   };
@@ -339,6 +358,15 @@ function DashboardContent() {
   const handleRunCalibration = () => {
     if (!file || refNPoints.length < 1 || refFillerPoints.length < 1) return;
     setCalibrationStep("done");
+
+    // Lock these picks as the session reference on the very first scan.
+    // All subsequent scans will reuse them automatically, keeping the
+    // N/Filler classification boundary identical across all scans.
+    if (sessionRefNPoints.length === 0) {
+      setSessionRefNPoints(refNPoints);
+      setSessionRefFillerPoints(refFillerPoints);
+    }
+
     analyzeImage(file, lastCropPoints, refNPoints, refFillerPoints);
   };
 
@@ -464,6 +492,23 @@ function DashboardContent() {
                 onRunCalibration={handleRunCalibration}
                 onRecalibrate={handleRecalibrate}
               />
+
+              {/* Session calibration locked indicator — shown from scan 2 onward */}
+              {sessionRefNPoints.length > 0 && !scanningComplete && scanResults.length > 0 && (
+                <div className="flex items-center gap-3 px-5 py-3 bg-violet-50 border border-violet-200 rounded-2xl text-xs text-violet-700 font-medium">
+                  <span className="shrink-0 w-2 h-2 rounded-full bg-violet-400" />
+                  <span>
+                    Using calibration from scan 1 ({sessionRefNPoints.length} N + {sessionRefFillerPoints.length} Filler points)
+                    — boundary is locked for consistent N/Filler classification.
+                  </span>
+                  <button
+                    onClick={() => { setSessionRefNPoints([]); setSessionRefFillerPoints([]); handleRecalibrate(); }}
+                    className="ml-auto text-xs text-violet-500 hover:text-violet-800 underline underline-offset-2 transition-colors whitespace-nowrap"
+                  >
+                    Override
+                  </button>
+                </div>
+              )}
 
               {/* Next scan prompt */}
               {calibrationStep === "done" && !scanningComplete && (
