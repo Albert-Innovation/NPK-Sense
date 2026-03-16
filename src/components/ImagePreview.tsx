@@ -94,7 +94,7 @@ const RefDot = memo(function RefDot({
     <div
       style={{ left: `${point.x * 100}%`, top: `${point.y * 100}%` }}
       className={[
-        "absolute -translate-x-1/2 -translate-y-1/2 z-10",
+        "absolute -translate-x-1/2 -translate-y-1/2 z-20",
         "w-5 h-5 rounded-full border-2 border-white shadow-lg ring-2",
         showDelete ? "pointer-events-auto" : "pointer-events-none",
         style.bg, style.ring,
@@ -106,9 +106,9 @@ const RefDot = memo(function RefDot({
       </span>
       {showDelete && (
         <button
-          onClick={e => { e.stopPropagation(); onDelete(); }}
+          onClick={e => { e.stopPr opagation(); onDelete(); }}
           style={{ top: -5, right: -5 }}
-          className="absolute w-3.5 h-3.5 rounded-full bg-white border border-slate-400 flex items-center justify-center text-[8px] font-black text-slate-600 leading-none cursor-pointer hover:bg-red-100 hover:border-red-400 hover:text-red-600 shadow"
+          className="absolute z-30 pointer-events-auto w-3.5 h-3.5 rounded-full bg-white border border-slate-400 flex items-center justify-center text-[8px] font-black text-slate-600 leading-none cursor-pointer hover:bg-red-100 hover:border-red-400 hover:text-red-600 shadow"
           title="Remove point"
         >
           ×
@@ -268,7 +268,7 @@ export default function ImagePreview({
               draggable={false}
               onClick={handleImageClick}
               className={[
-                "max-w-full max-h-[700px] object-contain shadow-2xl rounded-lg select-none",
+                "relative z-0 max-w-full max-h-[700px] object-contain shadow-2xl rounded-lg select-none",
                 isCalibrating ? "cursor-crosshair" : "",
               ].join(" ")}
             />
