@@ -291,7 +291,7 @@ The following steps execute inside a single call to `POST /analyze_interactive`:
 8. Normalize scores → percentages (sum = 100%)
         │
         ▼
-9. Visualization
+9. Visualizationn
    Darken original image (40% opacity overlay)
    Draw colored contours per class:
      N → gray (200, 200, 200)
